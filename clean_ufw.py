@@ -52,7 +52,7 @@ def ensure_root() -> None:
 def parse_ufw_status() -> List[int]:
     """Return a list of rule numbers that should be removed."""
     try:
-        output = subprocess.check_output(["ufw", "status", "numbered"], text=True)
+        output = subprocess.check_output(["/usr/sbin/ufw", "status", "numbered"], text=True)
     except subprocess.CalledProcessError as exc:
         sys.exit(f"[!] Failed to execute 'ufw': {exc}")
 
@@ -76,7 +76,7 @@ def delete_rules(rule_numbers: List[int]) -> None:
     for idx in sorted(rule_numbers, reverse=True):
         print(f"[+] Deleting rule #{idx}")
         try:
-            subprocess.check_call(["ufw", "--force", "delete", str(idx)])
+            subprocess.check_call(["/usr/sbin/ufw", "--force", "delete", str(idx)])
         except subprocess.CalledProcessError as exc:
             print(f"[!] Failed to delete rule {idx}: {exc}")
 
