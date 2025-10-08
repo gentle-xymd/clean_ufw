@@ -1,160 +1,127 @@
 #!/usr/bin/env python3
-"""
-clean_ufw.py – Smart UFW cleanup utility
-
-Removes any UFW rules that allow connections from *anywhere* (i.e. the rule's
-"From" column is "Anywhere" or "Anywhere (v6)") except for SSH (port 22).
-
-Features:
-1. Dry-run mode (default) so that you can see what would be removed.
-2. Confirmation prompt unless --yes is supplied.
-3. Works with both IPv4 and IPv6 rule listings.
-4. Requires root; will automatically re-exec with sudo if necessary.
-
-Usage examples
---------------
-# See what would be deleted, without actually deleting it
-sudo python3 clean_ufw.py --dry-run
-
-# Delete the rules (you will be prompted to confirm)
-sudo python3 clean_ufw.py
-
-# Delete without a confirmation prompt
-sudo python3 clean_ufw.py --yes
-"""
 from __future__ import annotations
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
-from typing import List
-from datetime import datetime
 import time
+from datetime import datetime
+from typing import List
 
-RULE_RE = re.compile(r"^\[\s*(?P<idx>\d+)\]\s+(?P<to>.+?)\s+ALLOW IN\s+(?P<from>.+)$")
+RULE_RE = re.compile(
+    r"^\[\s*(?P<idx>\d+)\]\s+(?P<to>.+?)\s+(?P<action>ALLOW|DENY)\s+(?P<dir>IN|OUT)\s+(?P<from>.+)$"
+)
 ANYWHERE_PATTERNS = ("Anywhere", "Anywhere (v6)")
-SSH_PORT_PATTERN = re.compile(r"\b22(/tcp)?\b")
-
+SSH_PORT_PATTERN = re.compile(r"\b22(?:/tcp)?\b")
+PROTECTED_DENY_PORTS = {
+    "21/tcp", "25/tcp", "3306/tcp", "33060/tcp", "6081/tcp", "20201/tcp", "20202/tcp",
+}
 
 def ensure_root() -> None:
-    """Re-exec the script with sudo if the effective UID is not root."""
-    if os.geteuid() == 0:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
         return
     try:
-        print("[i] Elevating privileges with sudo…", file=sys.stderr)
         os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
-    except FileNotFoundError:  # sudo not available or not in PATH
+    except FileNotFoundError:
         sys.exit("[!] This script must be run as root.")
 
+def find_ufw() -> str:
+    for candidate in (shutil.which("ufw"), "/usr/sbin/ufw", "/sbin/ufw"):
+        if candidate and os.path.exists(candidate):
+            return candidate
+    sys.exit("[!] 'ufw' not found. Is UFW installed?")
 
-def parse_ufw_status() -> List[int]:
-    """Return a list of rule numbers that should be removed."""
+def parse_ufw_status(ufw_bin: str, warn_protected: bool = False) -> List[int]:
     try:
-        output = subprocess.check_output(["/usr/sbin/ufw", "status", "numbered"], text=True)
+        output = subprocess.check_output([ufw_bin, "status", "numbered"], text=True)
     except subprocess.CalledProcessError as exc:
         sys.exit(f"[!] Failed to execute 'ufw': {exc}")
 
     rules_to_delete: List[int] = []
-    for line in output.splitlines():
-        m = RULE_RE.match(line.strip())
+    for raw in output.splitlines():
+        m = RULE_RE.match(raw.strip())
         if not m:
-            continue  # Skip headers/blank lines
+            continue
+
         idx = int(m["idx"])
         to_field = m["to"].strip()
+        action = m["action"].strip()
+        direction = m["dir"].strip()
         from_field = m["from"].strip()
 
-        # Keep port 22 rules from anywhere; delete the rest
-        if from_field in ANYWHERE_PATTERNS and not SSH_PORT_PATTERN.search(to_field):
-            rules_to_delete.append(idx)
+        # Only touch ALLOW IN rules from Anywhere / Anywhere (v6)
+        if action != "ALLOW" or direction != "IN" or from_field not in ANYWHERE_PATTERNS:
+            continue
+
+        # Keep ALLOW 22/tcp from Anywhere (SSH)
+        if SSH_PORT_PATTERN.search(to_field):
+            continue
+
+        # Optional warning if a protected port is ALLOWed (we will delete it anyway)
+        if warn_protected:
+            leading = to_field.split()[0]
+            if leading in PROTECTED_DENY_PORTS:
+                print(f"[!] ALLOW found for protected port (will delete): {to_field}")
+
+        rules_to_delete.append(idx)
+
     return rules_to_delete
 
-
-def delete_rules(rule_numbers: List[int]) -> None:
-    """Delete the given rule numbers *in descending order* to keep indices stable."""
+def delete_rules(ufw_bin: str, rule_numbers: List[int]) -> None:
     for idx in sorted(rule_numbers, reverse=True):
-        print(f"[+] Deleting rule #{idx}")
         try:
-            subprocess.check_call(["/usr/sbin/ufw", "--force", "delete", str(idx)])
+            subprocess.check_call([ufw_bin, "--force", "delete", str(idx)])
+            print(f"[✓] Deleted rule #{idx}")
         except subprocess.CalledProcessError as exc:
             print(f"[!] Failed to delete rule {idx}: {exc}")
 
-
-def single_cleanup(dry_run: bool, assume_yes: bool) -> None:
-    """Perform a single cleanup pass."""
-    rules = parse_ufw_status()
+def enforce_once(ufw_bin: str, dry_run: bool) -> None:
+    rules = parse_ufw_status(ufw_bin)
     if not rules:
-        print("[i] No matching rules found. Nothing to do.")
+        print("[i] No matching rules found.")
         return
-
-    print("[i] The following rule numbers will be deleted:", ", ".join(map(str, sorted(rules))))
-
+    print("[i] Targeted for deletion:", ", ".join(map(str, sorted(rules))))
     if dry_run:
-        print("[i] Dry-run mode active. No changes have been made.")
+        print("[i] Dry-run. No changes made.")
         return
+    delete_rules(ufw_bin, rules)
 
-    if not assume_yes:
-        confirm = input("Proceed with deletion? [y/N]: ").lower().strip()
-        if confirm != "y":
-            print("[i] Aborted by user. No changes made.")
-            return
-
-    delete_rules(rules)
-    print("[✓] Cleanup completed.")
-
-
-def watch_loop(interval: int, dry_run: bool, assume_yes: bool) -> None:
-    """Continuously monitor UFW and delete matching rules as soon as they appear."""
-    mode_msg = "continuously (no delay)" if interval == 0 else f"every {interval}s"
-    print(f"[i] Entering watch mode – checking {mode_msg}. Press Ctrl+C to exit.")
-
+def watch_loop(ufw_bin: str, interval: int, dry_run: bool) -> None:
+    print(f"[i] Watch mode every {interval}s. Ctrl+C to exit.")
     try:
         while True:
-            rules = parse_ufw_status()
-            if not rules:
-                print("[✓] No matching 'Anywhere' rules remain. Exiting.")
-                break
-
-            # Rules present – attempt deletion
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[i] {ts}: found {len(rules)} rule(s) ->", ", ".join(map(str, rules)))
-            if dry_run:
-                print("[i] Dry-run mode active – would delete these rules.")
-            else:
-
-                if not assume_yes:
-                    confirm = input("Proceed with deletion? [y/N]: ").lower().strip()
-                    if confirm == "y":
-                        delete_rules(rules)
-                        deleted = True
-                    else:
-                        print("[i] Skipping deletion this cycle.")
+            rules = parse_ufw_status(ufw_bin)
+            if rules:
+                print("[i] Targeted:", ", ".join(map(str, sorted(rules))))
+                if not dry_run:
+                    delete_rules(ufw_bin, rules)
                 else:
-                    delete_rules(rules)
-                    deleted = True
-
-            if interval > 0:
-                time.sleep(interval)
+                    print("[i] Dry-run. Would delete above.")
+            else:
+                print("[i] Nothing to delete.")
+            if interval <= 0:
+                break
+            time.sleep(interval)
     except KeyboardInterrupt:
-        print("\n[i] Watch mode interrupted by user. Exiting.")
-
+        print("\n[i] Exiting watch.")
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Remove UFW 'Anywhere' rules except SSH (22/tcp)")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be removed but do NOT remove it")
-    parser.add_argument("--yes", "-y", action="store_true", help="Do not prompt for confirmation")
-    parser.add_argument("--watch", "-w", nargs="?", const=0, type=int, metavar="SECONDS", help="Continuously monitor every SECONDS; 0 (default) = as fast as possible. If flag given without value, 0 is used.")
-
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Immediately delete ALLOW-from-Anywhere UFW rules except SSH (22/tcp).")
+    p.add_argument("--dry-run", action="store_true", help="Preview only (no changes)")
+    p.add_argument("--watch", "-w", nargs="?", const=5, type=int, metavar="SECONDS",
+                   help="Continuously enforce every SECONDS (default 5s if flag given without value)")
+    args = p.parse_args()
 
     ensure_root()
+    ufw_bin = find_ufw()
 
     if args.watch is not None:
-        watch_loop(args.watch, args.dry_run, args.yes)
+        watch_loop(ufw_bin, args.watch, args.dry_run)
     else:
-        single_cleanup(args.dry_run, args.yes)
-
+        enforce_once(ufw_bin, args.dry_run)
 
 if __name__ == "__main__":
     main()
